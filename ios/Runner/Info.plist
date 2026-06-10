@@ -26,6 +26,25 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Driver location is needed to show your position on the map during an active trip.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Driver location must be tracked in the background to maintain an accurate trip route even when the screen is locked.</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>Driver location must be tracked continuously during active trips.</string>
+
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>location</string>
+		<string>fetch</string>
+		<string>processing</string>
+		<string>remote-notification</string>
+	</array>
+
+	<key>GMSApiKey</key>
+	<string>AIzaSyCKERz07Y8_oBEb1c6WYKsHNpTvmTVvReE</string>
+
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

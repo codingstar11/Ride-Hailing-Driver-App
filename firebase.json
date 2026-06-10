@@ -1,0 +1,30 @@
+{
+    "flutter": {
+        "platforms": {
+            "android": {
+                "default": {
+                    "projectId": "ride-hailing-app-375aa",
+                    "appId": "1:465819976739:android:6d722ca9defcb95f16dd96",
+                    "fileOutput": "android/app/google-services.json"
+                }
+            },
+            "ios": {
+                "default": {
+                    "projectId": "ride-hailing-app-375aa",
+                    "appId": "1:465819976739:ios:6101db1a2bc762ee16dd96",
+                    "uploadDebugSymbols": false,
+                    "fileOutput": "ios/Runner/GoogleService-Info.plist"
+                }
+            },
+            "dart": {
+                "lib/firebase_options.dart": {
+                    "projectId": "ride-hailing-app-375aa",
+                    "configurations": {
+                        "android": "1:465819976739:android:6d722ca9defcb95f16dd96",
+                        "ios": "1:465819976739:ios:6101db1a2bc762ee16dd96"
+                    }
+                }
+            }
+        }
+    }
+}
