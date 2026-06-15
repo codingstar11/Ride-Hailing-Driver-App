@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:hive_flutter/hive_flutter.dart';
 import 'package:logger/logger.dart';
 import 'package:rxdart/rxdart.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,21 +13,6 @@ import '../../features/location/domain/entities/driver_location.dart';
 
 /// Datasource that reads/writes GPS location data using Hive.
 ///
-/// Responsibilities:
-///  1. Persist incoming GPS locations to the 'location_queue' LazyBox.
-///  2. Retrieve batches of pending entries for upload.
-///  3. Delete confirmed entries (server ACK removes from queue permanently).
-///  4. Expose a reactive count stream so the UI badge updates in real time.
-///  5. Write telemetry events for diagnosability.
-///
-/// Offline-first guarantee: saveLocation() completes before any network
-/// call is attempted. If the process is killed after save but before upload,
-/// the entry is still in the Hive box and will be retried on next launch.
-///
-/// Synchronisation after restart: [recoverPendingFromPreviousSession] scans
-/// all keys in the box. Any entry whose tripId matches the resumed trip is
-/// eligible for re-upload. Entries from a different (ended) trip are
-/// cleaned up after a configurable retention window.
 class LocationHiveDatasource {
   final _logger = Logger();
   final _uuid = const Uuid();
@@ -53,11 +39,19 @@ class LocationHiveDatasource {
       tripId: tripId,
     );
 
-    // Use the UUID as the Hive key for O(1) deletion on ACK.
     await box.put(key, entry);
-    _logger.d('[HiveDS] Saved location $key (trip: $tripId)');
+   
+    await box.flush();
 
-    await _writeTelemetry(
+    _logger.d('[HiveDS] Saved + flushed location $key (trip: $tripId)');
+
+    // Track the latest location key per trip for O(1) restoration.
+    await _setLatestLocationKey(tripId, key);
+
+    _refreshCount();
+
+    // Write telemetry non-blocking — failures must not affect the main flow.
+    _writeTelemetry(
       event: 'location_saved',
       tripId: tripId,
       extra: {
@@ -67,11 +61,6 @@ class LocationHiveDatasource {
         'accuracy': location.accuracy,
       },
     );
-
-    // Track the latest location key per trip for O(1) restoration.
-    await _setLatestLocationKey(tripId, key);
-
-    _refreshCount();
   }
 
   // ── Read ─────────────────────────────────────────────────────────────────
@@ -100,11 +89,6 @@ class LocationHiveDatasource {
   }
 
   /// Returns the single most-recent [LocationEntry] for [tripId], or null.
-  ///
-  /// Uses a dedicated 'latest_location_key:<tripId>' entry in the activeTrip
-  /// box to track the UUID of the last saved point.  This avoids the previous
-  /// O(n) scan (loading up to 500 entries and taking `.last`) in
-  /// [LocationRepositoryImpl._emitLatestSavedLocation].
   Future<LocationEntry?> getLatestLocation({required String tripId}) async {
     final key = _latestLocationKey(tripId);
     final latestUuid = HiveStorage.activeTrip.get(key)?['uuid'] as String?;
@@ -139,16 +123,13 @@ class LocationHiveDatasource {
 
   // ── Delete on ACK ────────────────────────────────────────────────────────
 
-  /// Removes entries confirmed by the server (ACK list = list of UUIDs).
-  ///
-  /// Deletion instead of marking: keeps the box small, avoids a separate
-  /// 'cleanup' sweep, and means the count badge is always accurate.
   Future<void> deleteConfirmed(List<String> uuids) async {
     final box = HiveStorage.locationQueue;
     await box.deleteAll(uuids);
-    _logger.d('[HiveDS] Deleted ${uuids.length} confirmed entries');
+    await box.flush();
+    _logger.d('[HiveDS] Deleted + flushed ${uuids.length} confirmed entries');
 
-    await _writeTelemetry(
+    _writeTelemetry(
       event: 'locations_confirmed',
       tripId: uuids.isNotEmpty ? 'batch' : 'empty',
       extra: {'count': uuids.length},
@@ -165,12 +146,11 @@ class LocationHiveDatasource {
     if (entry == null) return;
     entry.retryCount += 1;
     await box.put(uuid, entry);
+    // No flush needed here — retry count updates are advisory, not critical.
   }
 
   // ── Cleanup ──────────────────────────────────────────────────────────────
 
-  /// Removes entries older than [retentionDays] from any trip.
-  /// Called when a trip ends to prevent indefinite accumulation.
   Future<void> cleanupStaleEntries(
       {int retentionDays = AppConstants.uploadedRecordRetentionDays}) async {
     final cutoff = DateTime.now().subtract(Duration(days: retentionDays));
@@ -186,6 +166,7 @@ class LocationHiveDatasource {
 
     if (staleKeys.isNotEmpty) {
       await box.deleteAll(staleKeys);
+      await box.flush();
       _logger.i('[HiveDS] Cleaned up ${staleKeys.length} stale entries');
     }
   }
@@ -193,27 +174,96 @@ class LocationHiveDatasource {
   // ── Active trip persistence ──────────────────────────────────────────────
 
   Future<void> saveActiveTrip(String tripId) async {
-    await HiveStorage.activeTrip.put('current', {
+    final record = {
       'trip_id': tripId,
       'started_at': DateTime.now().toIso8601String(),
-    });
-    // Mirror to SharedPreferences so BootReceiver can read it
-    // before Flutter initialises on reboot.
+    };
+
+    final box = HiveStorage.activeTrip;
+    await box.put('current', record);
+    // Flush immediately so this record survives a process kill.
+    // This is the most critical flush in the entire codebase — without it,
+    // every app relaunch after being killed loses the active trip and the
+    // driver sees "Start Trip" instead of the active trip being restored.
+    await box.flush();
+
+    // Mirror to SharedPreferences as a secondary durability guarantee.
+    // SharedPreferences writes through to disk immediately (commit() on Android,
+    // NSUserDefaults synchronize() on iOS). This is the fallback read path in
+    // getActiveTripId() for the case where the Hive flush was somehow still
+    // delayed (e.g. very rapid kill immediately after put()).
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('active_trip_id', tripId);
-    _logger.i('[HiveDS] Active trip saved: $tripId');
+    await prefs.setString(
+      'active_trip_started_at',
+      record['started_at'] as String,
+    );
+
+    _logger.i('[HiveDS] Active trip saved + flushed: $tripId');
   }
 
+  /// Returns the active trip ID, checking Hive first then SharedPreferences.
+  ///
+  /// Two-source read is necessary because Hive's flush is asynchronous:
+  /// if the process was killed before Hive flushed its write buffer, the
+  /// activeTrip box will be empty on the next launch even though saveActiveTrip
+  /// was called. SharedPreferences flushes synchronously, so it is always
+  /// the authoritative fallback.
   Future<String?> getActiveTripId() async {
+    // Primary: Hive (fast, in-memory once box is open)
     final data = HiveStorage.activeTrip.get('current');
-    return data?['trip_id'] as String?;
+    final tripIdFromHive = data?['trip_id'] as String?;
+    if (tripIdFromHive != null && tripIdFromHive.isNotEmpty) {
+      return tripIdFromHive;
+    }
+
+    // Fallback: SharedPreferences
+    // This path is taken when Hive was not flushed before the last kill.
+    final prefs = await SharedPreferences.getInstance();
+    final tripIdFromPrefs = prefs.getString('active_trip_id');
+    if (tripIdFromPrefs != null && tripIdFromPrefs.isNotEmpty) {
+      _logger.w(
+        '[HiveDS] Active trip recovered from SharedPreferences fallback '
+        '(Hive was not flushed before last kill)  trip=$tripIdFromPrefs',
+      );
+      // Re-write to Hive so subsequent reads hit the fast path.
+      // Do NOT await — this is a best-effort repair; we don't want to
+      // block the caller on this recovery write.
+      _repairActiveTripInHive(tripIdFromPrefs);
+      return tripIdFromPrefs;
+    }
+
+    return null;
+  }
+
+  /// Re-writes the active trip record to Hive after recovering it from
+  /// SharedPreferences. Runs asynchronously so it doesn't block the caller.
+  Future<void> _repairActiveTripInHive(String tripId) async {
+    try {
+      final box = HiveStorage.activeTrip;
+      await box.put('current', {
+        'trip_id': tripId,
+        'started_at': (await SharedPreferences.getInstance())
+                .getString('active_trip_started_at') ??
+            DateTime.now().toIso8601String(),
+      });
+      await box.flush();
+      _logger.i('[HiveDS] Repaired Hive active trip record  trip=$tripId');
+    } catch (e) {
+      _logger.w('[HiveDS] Failed to repair Hive active trip: $e');
+    }
   }
 
   Future<void> clearActiveTrip() async {
-    await HiveStorage.activeTrip.delete('current');
-    // Clear the mirror so BootReceiver does not restart after trip ends.
+    final box = HiveStorage.activeTrip;
+    await box.delete('current');
+    await box.flush();
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('active_trip_id');
+    await prefs.remove('active_trip_started_at');
+
+    _logger.i('[HiveDS] Active trip cleared from Hive + SharedPreferences');
   }
 
   // ── Completed trip archive ───────────────────────────────────────────────
@@ -221,17 +271,12 @@ class LocationHiveDatasource {
   Future<void> archiveCompletedTrip(Map<String, dynamic> tripSummary) async {
     final tripId = tripSummary['trip_id'] as String;
     await HiveStorage.completedTrips.put(tripId, tripSummary);
+    // No flush needed — completed trip archives are advisory, not critical.
     _logger.i('[HiveDS] Archived completed trip: $tripId');
   }
 
   // ── Telemetry ────────────────────────────────────────────────────────────
 
-  /// Public entry-point so [LocationRepositoryImpl] can persist telemetry
-  /// events from the repository layer (e.g. connectivity changes, trip
-  /// lifecycle, upload results) to the same Hive telemetry box.
-  ///
-  /// Previously the repository's _writeTelemetry() only called AppLogger and
-  /// discarded the data.  Now all critical events are durably persisted.
   Future<void> writeTelemetryEvent({
     required String event,
     required String tripId,
@@ -251,25 +296,23 @@ class LocationHiveDatasource {
         payload: jsonEncode(extra),
         timestamp: DateTime.now(),
       );
-      // Key = timestamp + event for chronological ordering.
       final key = '${DateTime.now().millisecondsSinceEpoch}_$event';
       await HiveStorage.telemetry.put(key, entry);
+      // Telemetry writes are NOT flushed — they are advisory. If the process
+      // is killed before Hive flushes, losing a few telemetry entries is acceptable.
     } catch (e) {
-      // Telemetry must never crash the main flow.
       _logger.w('[HiveDS] Telemetry write failed: $e');
     }
   }
 
   // ── Latest location tracking ─────────────────────────────────────────────
 
-  /// Stores the UUID of the most recently saved location for [tripId] so it
-  /// can be retrieved in O(1) without scanning the full queue.
   Future<void> _setLatestLocationKey(String tripId, String uuid) async {
-    await HiveStorage.activeTrip
-        .put(_latestLocationKey(tripId), {'uuid': uuid});
+    final box = HiveStorage.activeTrip;
+    await box.put(_latestLocationKey(tripId), {'uuid': uuid});
+    await box.flush();
   }
 
-  /// Key used in the activeTrip box to look up the latest location UUID.
   static String _latestLocationKey(String tripId) => 'latest_loc:$tripId';
 
   // ── Reactive count ───────────────────────────────────────────────────────

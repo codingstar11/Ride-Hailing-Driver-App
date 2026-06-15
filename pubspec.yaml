@@ -11,9 +11,8 @@ dependencies:
     sdk: flutter
 
   # Location & Maps
-  geolocator: ^11.0.0
+  flutter_background_geolocation: ^5.2.1
   google_maps_flutter: ^2.6.0
-  flutter_background_service: ^5.0.0
   permission_handler: ^11.0.0
 
   # Firebase
@@ -34,7 +33,7 @@ dependencies:
   # State Management
   flutter_bloc: ^8.1.5
   bloc: ^8.1.4
-  bloc_concurrency: 
+  bloc_concurrency:
   equatable: ^2.0.5
 
   # DI

@@ -1,4 +1,5 @@
-import 'package:geolocator/geolocator.dart';
+import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
+    as bg;
 import 'package:permission_handler/permission_handler.dart' as ph;
 
 import '../../../../core/utils/app_logger.dart';
@@ -32,11 +33,15 @@ class StartTrackingUseCase {
   StartTrackingUseCase(this._repository);
 
   Future<TrackingStartResult> call(String tripId) async {
-    // ── Step 1: Location services ──────────────────────────────────────────
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      AppLogger.locationServicesDisabled();
-      return TrackingStartResult.locationServicesDisabled;
+    // ── Step 1: Location services ────────────────
+    try {
+      final state = await bg.BackgroundGeolocation.providerState;
+      if (!state.enabled) {
+        AppLogger.locationServicesDisabled();
+        return TrackingStartResult.locationServicesDisabled;
+      }
+    } catch (e) {
+      AppLogger.warn('START_TRACKING', 'providerState check failed: $e');
     }
 
     // ── Step 2: Foreground location permission ─────────────────────────────

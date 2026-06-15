@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
+    as bg;
 
 import 'core/config/backend_config.dart';
 import 'core/services/background_service_handler.dart';
@@ -13,6 +15,10 @@ import 'firebase_options.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Register the headless task immediately after binding initialisation,
+  // before any other plugin calls.
+  bg.BackgroundGeolocation.registerHeadlessTask(headlessTask);
 
   AppLogger.info('MAIN', '══════ Driver App Starting ══════');
   AppLogger.info('MAIN', 'Backend: ${activeBackend.name}');
@@ -36,17 +42,18 @@ void main() async {
   await configureDependencies();
   AppLogger.info('MAIN', 'DI ready');
 
-  // 4. Register background service.
-  AppLogger.info('MAIN', 'Initialising background service…');
+  // 4. Initialize flutter_background_geolocation plugin.
+  // Must be called before any bg.BackgroundGeolocation API calls.
+  AppLogger.info('MAIN', 'Initialising background geolocation…');
   await BackgroundServiceHandler.initialize();
-  AppLogger.info('MAIN', 'Background service registered');
+  AppLogger.info('MAIN', 'Background geolocation ready');
 
   // 5. Post-reboot / process-kill recovery.
   AppLogger.info('MAIN', 'Checking for post-reboot trip recovery…');
   final restored = await BootReceiver.checkAndRestoreIfNeeded();
   if (restored) {
     AppLogger.info('MAIN',
-        'Trip restored after reboot/kill — background service restarted');
+        'Trip restored after reboot/kill — background geolocation restarted');
   } else {
     AppLogger.info('MAIN', 'No post-reboot recovery needed');
   }

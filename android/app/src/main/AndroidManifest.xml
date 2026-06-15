@@ -6,6 +6,10 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
 
+    <!-- Activity recognition for motion detection / stationary detection -->
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+    <uses-permission android:name="com.google.android.gms.permission.ACTIVITY_RECOGNITION" />
+
     <!-- Foreground service permissions -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
@@ -22,6 +26,12 @@
 
     <!-- Reboot recovery -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- flutter_background_geolocation: change events while device is rebooting -->
+    <uses-permission android:name="android.permission.BOOT_COMPLETED" />
+
+    <!-- REQUIRED for battery optimization opt-out dialog -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:label="Driver Tracker"
@@ -47,19 +57,26 @@
             </intent-filter>
         </activity>
 
+        <!-- flutter_background_geolocation foreground service -->
         <service
-            android:name="id.flutter.flutter_background_service.BackgroundService"
+            android:name="com.transistorsoft.locationmanager.service.TrackingService"
             android:foregroundServiceType="location"
-            android:exported="true"
-            android:stopWithTask="false"
-            tools:replace="android:foregroundServiceType,android:exported" />
+            android:exported="false" />
 
+        <service
+            android:name="com.transistorsoft.locationmanager.service.LocationRequestService"
+            android:foregroundServiceType="location"
+            android:exported="false" />
+
+        <!-- flutter_background_geolocation boot receiver (auto-restart after reboot) -->
         <receiver
-            android:name=".BootReceiver"
-            android:exported="true">
+            android:name="com.transistorsoft.locationmanager.motionactivity.TSDeviceBootReceiver"
+            android:exported="true"
+            android:enabled="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
 

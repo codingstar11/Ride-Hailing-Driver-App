@@ -43,4 +43,9 @@ abstract class LocationRepository {
 
   /// Live stream of location updates from foreground GPS (used before trip starts)
   Stream<DriverLocation> get foregroundLocationStream;
+
+  /// Shared entry point for processing a raw background location event.
+  /// Used by both the standard stream listener and the headless runner task,
+  /// ensuring identical save/upload logic regardless of how the event arrived.
+  Future<void> handleBackgroundLocationEvent(Map<String, dynamic> event);
 }

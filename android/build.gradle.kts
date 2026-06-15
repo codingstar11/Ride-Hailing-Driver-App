@@ -2,6 +2,8 @@ allprojects {
     repositories {
         google()
         mavenCentral()
+        maven(url = "https://dl.cloudsmith.io/public/transistorsoft/background-geolocation/maven/")
+        maven(url = "https://jitpack.io")
     }
 }
 

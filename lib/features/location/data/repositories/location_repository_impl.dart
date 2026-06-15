@@ -1,5 +1,7 @@
 import 'dart:async';
-import 'package:geolocator/geolocator.dart';
+import 'dart:math';
+import 'package:flutter_background_geolocation/flutter_background_geolocation.dart'
+    as bg;
 import 'package:logger/logger.dart';
 import 'package:uuid/uuid.dart';
 
@@ -15,19 +17,6 @@ import '../../domain/repositories/location_repository.dart';
 import '../datasources/location_remote_datasource.dart';
 
 /// Repository coordinating Hive persistence, backend uploads (Firebase or
-/// Mock), background service events, and connectivity-driven sync.
-///
-/// Data flow (happy path)
-/// ──────────────────────
-///   BackgroundService → locationUpdate event
-///       ↓
-///   _onLocationReceived() — accuracy gate (≤ minAccuracyMeters from config)
-///       ↓
-///   LocationHiveDatasource.saveLocation()     ← written to Hive first
-///       ↓  (if online & batch threshold met)
-///   _tryUpload() → LocationRemoteDatasource.uploadLocationBatch()
-///       ↓  (on ACK)
-///   LocationHiveDatasource.deleteConfirmed()
 class LocationRepositoryImpl implements LocationRepository {
   final LocationHiveDatasource _localDatasource;
   final LocationRemoteDatasource _remoteDatasource;
@@ -52,6 +41,12 @@ class LocationRepositoryImpl implements LocationRepository {
 
   final _locationStreamController =
       StreamController<DriverLocation>.broadcast();
+
+  // Upload lock — always reset in finally. Paired with a timeout guard so a
+  // process-suspend mid-upload never permanently blocks future uploads.
+  bool _isUploading = false;
+  DateTime? _uploadStartedAt;
+  static const Duration _uploadTimeout = Duration(seconds: 30);
 
   LocationRepositoryImpl({
     required LocationHiveDatasource localDatasource,
@@ -86,7 +81,7 @@ class LocationRepositoryImpl implements LocationRepository {
     );
   }
 
-  // ── LocationRepository interface ─────────────────────────────────────────
+  // ── LocationRepository interface ──────────────────────────────────────────
 
   @override
   bool get isTracking => _isTracking;
@@ -122,25 +117,25 @@ class LocationRepositoryImpl implements LocationRepository {
     AppLogger.tripStarted(tripId);
     _writeTelemetry(AppConstants.evtTripStarted, {'tripId': tripId});
 
+    // saveActiveTrip now calls box.flush() internally.
     await _localDatasource.saveActiveTrip(tripId);
     await _remoteDatasource.reportTripStarted(tripId);
     await _recoverFromPreviousSession(tripId);
 
-    // Allow any previously-stopping service instance to fully shut down
-    // before starting a new one. The stopService invoke is fire-and-forget
-    // so without this delay the new onStart may race with the old stopSelf.
-    await Future.delayed(const Duration(milliseconds: 500));
+    BackgroundServiceHandler.resetCounters();
 
-    await BackgroundServiceHandler.startService();
+    // Subscribe BEFORE starting the plugin so no events are lost on a
+    // broadcast stream that has zero listeners.
+    _subscribeToBackgroundStreams(tripId);
 
-    BackgroundServiceHandler.applyCountryConfig(
+    await BackgroundServiceHandler.applyCountryConfig(
       intervalSeconds: _config.locationIntervalSeconds.toInt(),
       distanceMeters: _config.locationDistanceMeters,
       accuracyThreshold: _config.minAccuracyMeters,
       tripId: tripId,
     );
 
-    _subscribeToBackgroundStreams(tripId);
+    await BackgroundServiceHandler.startService();
   }
 
   @override
@@ -161,17 +156,26 @@ class LocationRepositoryImpl implements LocationRepository {
     _writeTelemetry(
         'trip_resumed', {'tripId': tripId, 'resumedSeq': _sequenceNumber});
 
+    // Ensure the active trip record is in Hive (it may have been recovered
+    // from SharedPreferences and re-written asynchronously by getActiveTripId).
+    // Call saveActiveTrip again to guarantee a fresh flush.
+    await _localDatasource.saveActiveTrip(tripId);
+
     await _emitLatestSavedLocation(tripId);
     await _recoverFromPreviousSession(tripId);
-    await BackgroundServiceHandler.startService();
 
-    BackgroundServiceHandler.applyCountryConfig(
+    BackgroundServiceHandler.resetCounters();
+
+    _subscribeToBackgroundStreams(tripId);
+
+    await BackgroundServiceHandler.applyCountryConfig(
       intervalSeconds: _config.locationIntervalSeconds.toInt(),
       distanceMeters: _config.locationDistanceMeters,
       accuracyThreshold: _config.minAccuracyMeters,
+      tripId: tripId,
     );
 
-    _subscribeToBackgroundStreams(tripId);
+    await BackgroundServiceHandler.startService();
   }
 
   Future<void> _emitLatestSavedLocation(String tripId) async {
@@ -200,6 +204,11 @@ class LocationRepositoryImpl implements LocationRepository {
   }
 
   void _subscribeToBackgroundStreams(String tripId) {
+    _bgLocationSub?.cancel();
+    _bgHeartbeatSub?.cancel();
+    _bgAccuracySub?.cancel();
+    _bgErrorSub?.cancel();
+
     _bgLocationSub = BackgroundServiceHandler.locationStream.listen(
       _onLocationReceived,
       onError: (Object e) {
@@ -219,7 +228,6 @@ class LocationRepositoryImpl implements LocationRepository {
           _writeTelemetry('heartbeat', {
             'count': count,
             'emittedTotal': data['emittedTotal'],
-            'accuracy': data['accuracy'],
           });
         }
       },
@@ -244,7 +252,7 @@ class LocationRepositoryImpl implements LocationRepository {
       },
     );
 
-    _logger.i('[Repo] All background streams subscribed for trip=$tripId');
+    _logger.i('[Repo] Background streams subscribed  trip=$tripId');
   }
 
   @override
@@ -255,6 +263,13 @@ class LocationRepositoryImpl implements LocationRepository {
     final tripId = _currentTripId;
 
     if (tripId != null) {
+      // Wait for any in-flight upload to complete (up to 3 s).
+      int waitMs = 0;
+      while (_isUploading && waitMs < 3000) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        waitMs += 100;
+      }
+
       final pendingBeforeStop =
           await _localDatasource.getPendingCount(tripId: tripId);
       if (pendingBeforeStop > 0) {
@@ -295,12 +310,33 @@ class LocationRepositoryImpl implements LocationRepository {
         'pending_points_at_end': totalPoints,
       });
 
-      await _remoteDatasource.reportTripEnded(
-        tripId: tripId,
-        totalPoints: _sequenceNumber,
-      );
+      bool ended = false;
+      for (int attempt = 1; attempt <= 3 && !ended; attempt++) {
+        try {
+          await _remoteDatasource.reportTripEnded(
+            tripId: tripId,
+            totalPoints: _sequenceNumber,
+          );
+          ended = true;
+        } catch (e) {
+          AppLogger.warn('REPO', 'reportTripEnded attempt $attempt failed: $e');
+          if (attempt < 3) {
+            await Future<void>.delayed(Duration(seconds: attempt));
+          }
+        }
+      }
+      if (!ended) {
+        AppLogger.error(
+            'REPO',
+            'reportTripEnded failed after 3 attempts — trip $tripId may remain active in Firestore',
+            null);
+      }
 
-      await _localDatasource.clearActiveTrip();
+      final remaining = await _localDatasource.getPendingCount(tripId: tripId);
+      if (remaining == 0) {
+        await _localDatasource.clearActiveTrip();
+      }
+
       _writeTelemetry(AppConstants.evtTripEnded, {
         'tripId': tripId,
         'totalPoints': _sequenceNumber,
@@ -309,6 +345,7 @@ class LocationRepositoryImpl implements LocationRepository {
     }
 
     await _localDatasource.cleanupStaleEntries();
+
     _currentTripId = null;
     AppLogger.tripStopped(tripId ?? 'unknown', totalPoints: _sequenceNumber);
   }
@@ -321,9 +358,23 @@ class LocationRepositoryImpl implements LocationRepository {
 
   @override
   Future<int> uploadPendingLocations() async {
-    // Prefer in-memory tripId; fall back to Hive for the boot-recovery path
-    // where the background service is running but resumeTracking() has not
-    // yet been called (process killed, service restarted by BootReceiver).
+    // Stuck-lock guard: if the flag has been held longer than _uploadTimeout
+    // (e.g. process was suspended mid-upload), force-release it.
+    if (_isUploading) {
+      final started = _uploadStartedAt;
+      if (started != null &&
+          DateTime.now().difference(started) > _uploadTimeout) {
+        _logger.w(
+            '[Repo] Upload lock held for >${_uploadTimeout.inSeconds}s — force-releasing');
+        _isUploading = false;
+        _uploadStartedAt = null;
+      } else {
+        _logger
+            .d('[Repo] Upload already in progress — skipping concurrent call');
+        return 0;
+      }
+    }
+
     final tripId = _currentTripId ?? await _localDatasource.getActiveTripId();
     if (tripId == null) return 0;
 
@@ -336,20 +387,20 @@ class LocationRepositoryImpl implements LocationRepository {
       return 0;
     }
 
-    // Resolve driverId once per upload batch — non-blocking, defaults to null.
     String? driverId;
     try {
       final profile = await _profileService.getProfile();
       driverId = profile.id.isEmpty ? null : profile.id;
-    } catch (_) {
-      // driverId stays null — upload proceeds without it.
-    }
+    } catch (_) {}
 
     AppLogger.uploadStarted(pending.length, tripId);
     _writeTelemetry('upload_attempt', {
       'count': pending.length,
       'tripId': tripId,
     });
+
+    _isUploading = true;
+    _uploadStartedAt = DateTime.now();
 
     try {
       final ackIds = await _remoteDatasource.uploadLocationBatch(
@@ -365,6 +416,17 @@ class LocationRepositoryImpl implements LocationRepository {
           'count': ackIds.length,
           'tripId': tripId,
         });
+
+        if (!_isTracking) {
+          final remaining =
+              await _localDatasource.getPendingCount(tripId: tripId);
+          if (remaining == 0) {
+            await _localDatasource.clearActiveTrip();
+            _logger.i(
+                '[Repo] All pending uploaded post-stop — active trip marker cleared');
+          }
+        }
+
         return ackIds.length;
       }
     } catch (e) {
@@ -377,42 +439,56 @@ class LocationRepositoryImpl implements LocationRepository {
         'tripId': tripId,
         'pendingCount': pending.length,
       });
+    } finally {
+      // Always release the lock — even if an exception is thrown anywhere
+      // between _isUploading = true and this finally block.
+      _isUploading = false;
+      _uploadStartedAt = null;
     }
 
     return 0;
   }
 
-  // ── Internal ─────────────────────────────────────────────────────────────
+  // ── Internal ──────────────────────────────────────────────────────────────
 
   Future<void> _onLocationReceived(Map<String, dynamic>? event) async {
     if (event == null) return;
+    await handleBackgroundLocationEvent(event);
+  }
 
+  @override
+  Future<void> handleBackgroundLocationEvent(Map<String, dynamic> event) async {
     final activeTripId =
         _currentTripId ?? await _localDatasource.getActiveTripId();
     if (activeTripId == null) return;
 
+    // Self-heal: restore in-memory state if the repo was restarted but Hive
+    // (or SharedPreferences) still has the active trip.
     if (_currentTripId == null) {
       _currentTripId = activeTripId;
       _isTracking = true;
-      AppLogger.info('REPO',
-          'Recovered _currentTripId from Hive in _onLocationReceived  trip=$activeTripId');
+      AppLogger.info(
+          'REPO', 'Recovered _currentTripId from storage  trip=$activeTripId');
     }
 
     try {
       final accuracy = (event['accuracy'] as num).toDouble();
       final lat = (event['latitude'] as num).toDouble();
       final lng = (event['longitude'] as num).toDouble();
+      final tsRaw = event['timestamp'];
+      final timestamp = tsRaw is String
+          ? DateTime.tryParse(tsRaw) ?? DateTime.now()
+          : DateTime.now();
 
       AppLogger.locationReceived(
         lat: lat,
         lng: lng,
         accuracy: accuracy,
-        speed: event['speed'] != null ? (event['speed'] as num).toDouble() : null,
+        speed:
+            event['speed'] != null ? (event['speed'] as num).toDouble() : null,
       );
 
-      // Accuracy gate — only for UI stream filtering; background isolate
-      // already applied this gate before persisting.
-      if (accuracy > _config.minAccuracyMeters) {
+     if (accuracy > _config.minAccuracyMeters) {
         AppLogger.locationDiscarded(accuracy);
         return;
       }
@@ -427,17 +503,31 @@ class LocationRepositoryImpl implements LocationRepository {
         heading: event['heading'] != null
             ? (event['heading'] as num).toDouble()
             : null,
-        speed: event['speed'] != null
-            ? (event['speed'] as num).toDouble()
-            : null,
-        timestamp: DateTime.parse(event['timestamp'] as String),
+        speed:
+            event['speed'] != null ? (event['speed'] as num).toDouble() : null,
+        timestamp: timestamp,
       );
 
-      // Emit to UI stream only — the background isolate already persisted
-      // this location to Hive and uploaded it to Firestore.
+      // Write to Hive + flush() before attempting any upload.
+      // If the upload fails or the process is killed mid-upload, the entry
+      // is already on disk and will be retried on the next launch.
+      await _localDatasource.saveLocation(location, activeTripId);
+      _sequenceNumber++;
+
+      // Emit to UI stream (MapBloc consumes this).
       _locationStreamController.add(location);
 
-      // Telemetry only (no Hive save, no upload trigger here).
+      // Trigger upload non-blocking. Using unawaited + catchError so the
+      // location processing pipeline is never blocked waiting for Firestore.
+      // The _isUploading guard inside uploadPendingLocations() serialises
+      // concurrent calls; the timeout guard prevents a stuck flag.
+      if (_connectivityService.isConnected) {
+        uploadPendingLocations().catchError((Object e) {
+          AppLogger.error('REPO', 'Background upload error (non-fatal)', e);
+          return 0;
+        });
+      }
+
       _writeTelemetry('location_received', {
         'lat': lat,
         'lng': lng,
@@ -447,6 +537,19 @@ class LocationRepositoryImpl implements LocationRepository {
       AppLogger.error('REPO', 'Error processing location event', e);
     }
   }
+
+  double _calculateDistance(
+      double lat1, double lng1, double lat2, double lng2) {
+    const earthRadius = 6371000.0;
+    final dLat = _toRad(lat2 - lat1);
+    final dLng = _toRad(lng2 - lng1);
+    final a = sin(dLat / 2) * sin(dLat / 2) +
+        cos(_toRad(lat1)) * cos(_toRad(lat2)) * sin(dLng / 2) * sin(dLng / 2);
+    final c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    return earthRadius * c;
+  }
+
+  double _toRad(double deg) => deg * pi / 180.0;
 
   Future<void> _recoverFromPreviousSession(String tripId) async {
     final recovered =
@@ -466,7 +569,12 @@ class LocationRepositoryImpl implements LocationRepository {
     });
 
     if (_connectivityService.isConnected) {
-      await uploadPendingLocations();
+      try {
+        await uploadPendingLocations();
+      } catch (e) {
+        AppLogger.warn(
+            'REPO', 'Session recovery upload failed (will retry): $e');
+      }
     }
   }
 
@@ -491,86 +599,57 @@ class LocationRepositoryImpl implements LocationRepository {
   @override
   Stream<DriverLocation> get foregroundLocationStream {
     final controller = StreamController<DriverLocation>.broadcast();
+    StreamSubscription? innerSub;
 
     controller.onListen = () async {
       try {
-        final permission = await Geolocator.checkPermission();
-        if (permission == LocationPermission.denied ||
-            permission == LocationPermission.deniedForever) {
-          AppLogger.warn(
-              'REPO', 'Foreground stream: permission not granted — skipping seed fix');
-          return;
-        }
-
-        final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-        if (!serviceEnabled) {
-          AppLogger.warn('REPO', 'Foreground stream: location services disabled');
-          return;
-        }
-
-        final seed = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high,
-          timeLimit: const Duration(seconds: 10),
+        final pos = await bg.BackgroundGeolocation.getCurrentPosition(
+          samples: 1,
+          desiredAccuracy: 40,
+          timeout: 10,
+          maximumAge: 10000,
         );
         if (!controller.isClosed) {
           controller.add(DriverLocation(
             id: _uuid.v4(),
-            latitude: seed.latitude,
-            longitude: seed.longitude,
-            accuracy: seed.accuracy,
-            heading: seed.heading,
-            speed: seed.speed,
-            timestamp: seed.timestamp,
+            latitude: pos.coords.latitude,
+            longitude: pos.coords.longitude,
+            accuracy: pos.coords.accuracy,
+            heading: pos.coords.heading,
+            speed: pos.coords.speed,
+            timestamp: DateTime.tryParse(pos.timestamp) ?? DateTime.now(),
           ));
-          AppLogger.info(
-            'REPO',
-            'Foreground seed fix: '
-                'lat=${seed.latitude.toStringAsFixed(6)} '
-                'lng=${seed.longitude.toStringAsFixed(6)} '
-                'acc=${seed.accuracy.toStringAsFixed(1)}m',
-          );
         }
       } catch (e) {
         AppLogger.warn('REPO', 'Foreground seed fix failed: $e');
       }
 
       if (!controller.isClosed) {
-        try {
-          final permission = await Geolocator.checkPermission();
-          if (permission == LocationPermission.denied ||
-              permission == LocationPermission.deniedForever) {
-            return;
-          }
-          Geolocator.getPositionStream(
-            locationSettings: const LocationSettings(
-              accuracy: LocationAccuracy.high,
-              distanceFilter: 5,
-            ),
-          ).listen(
-            (pos) {
-              if (!controller.isClosed) {
-                controller.add(DriverLocation(
-                  id: _uuid.v4(),
-                  latitude: pos.latitude,
-                  longitude: pos.longitude,
-                  accuracy: pos.accuracy,
-                  heading: pos.heading,
-                  speed: pos.speed,
-                  timestamp: pos.timestamp,
-                ));
-              }
-            },
-            onError: (Object e) {
-              AppLogger.warn('REPO', 'Foreground position stream error: $e');
-            },
-            onDone: () {
-              if (!controller.isClosed) controller.close();
-            },
-          );
-        } catch (e) {
-          AppLogger.warn('REPO', 'Could not start foreground position stream: $e');
-        }
+        innerSub = _locationStreamController.stream.listen(
+          (loc) {
+            // FIX: The original condition `!_isTracking` caused foreground UI
+            // (MapBloc) to receive ZERO location updates while tracking was
+            // active. The intent was to stop emitting after trip ends, but
+            // the condition was inverted. The stream should forward all events
+            // while the controller is open; the caller cancels the subscription
+            // when it no longer needs updates.
+            if (!controller.isClosed) {
+              controller.add(loc);
+            }
+          },
+          onError: (Object e) {
+            AppLogger.warn('REPO', 'Foreground stream error: $e');
+          },
+          onDone: () {
+            if (!controller.isClosed) controller.close();
+          },
+        );
       }
+    };
+
+    controller.onCancel = () {
+      innerSub?.cancel();
+      innerSub = null;
     };
 
     return controller.stream;

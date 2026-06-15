@@ -34,6 +34,10 @@
 	<key>NSLocationAlwaysUsageDescription</key>
 	<string>Driver location must be tracked continuously during active trips.</string>
 
+	<!-- Required by flutter_background_geolocation for motion/activity API -->
+	<key>NSMotionUsageDescription</key>
+	<string>Activity recognition is used to detect when the vehicle is stationary so battery-draining GPS is automatically paused.</string>
+
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>
